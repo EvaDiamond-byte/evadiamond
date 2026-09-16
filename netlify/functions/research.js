@@ -1,5 +1,346 @@
-exports.handler=async(event)=>{if(event.httpMethod!=="POST")return out(405,{error:"Method not allowed"});try{let b=JSON.parse(event.body||"{}"),name=String(b.name||"").trim();if(!name)return out(400,{error:"Person name is required"});let wiki=await wikipedia(name),wd=await wikidata(name),sources=[];if(wiki)sources.push({title:"Wikipedia — "+wiki.title,url:wiki.url});if(wd)sources.push({title:"Wikidata — "+name,url:"https://www.wikidata.org/wiki/"+wd.id});let context=(wiki?.extract||"")+"\nWIKIDATA: "+JSON.stringify(wd?.claims||{});let marital=wd?.spouse?"A spouse relationship is publicly recorded; verify current status with current reputable sources.":"Not publicly confirmed from the starter public records. This does not mean the person is unmarried.";if(!process.env.AI_API_KEY)return out(200,{person:wiki?.title||name,maritalStatus:marital,answer:wiki?.extract||"No suitable public biography was found.",sources});let answer=await ai(name,b.researchType,b.question,context);return out(200,{person:wiki?.title||name,maritalStatus:marital,answer,sources})}catch(e){console.error(e);return out(500,{error:"BioIntel could not complete the request"})}};
-function out(status,body){return{statusCode:status,headers:{"Content-Type":"application/json","Access-Control-Allow-Origin":"*"},body:JSON.stringify(body)}}
-async function wikipedia(n){let s=await fetch("https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch="+encodeURIComponent(n)+"&format=json&origin=*").then(r=>r.json()),t=s?.query?.search?.[0]?.title;if(!t)return null;let p=await fetch("https://en.wikipedia.org/api/rest_v1/page/summary/"+encodeURIComponent(t)).then(r=>r.ok?r.json():null);return p?{title:p.title,extract:p.extract||"",url:p.content_urls?.desktop?.page||"https://en.wikipedia.org/wiki/"+encodeURIComponent(t)}:null}
-async function wikidata(n){let s=await fetch("https://www.wikidata.org/w/api.php?action=wbsearchentities&search="+encodeURIComponent(n)+"&language=en&format=json&origin=*").then(r=>r.json()),id=s?.search?.[0]?.id;if(!id)return null;let e=await fetch("https://www.wikidata.org/wiki/Special:EntityData/"+id+".json").then(r=>r.json()),c=e.entities[id]?.claims||{};return{id,claims:c,spouse:c?.P26?.[0]?.mainsnak?.datavalue?.value?.id||null}}
-async function ai(name,type,q,context){let prompt=`You are EvaDiamond BioIntel. Research ${name}. Area: ${type}. Question: ${q||"Give the requested biography."} Use ONLY the supplied public-source context. Do not invent. Do not expose private or sensitive data. For marriage, never infer unmarried from missing evidence; say not publicly confirmed when appropriate. Explain uncertainty.\n\n${context}`,url=process.env.AI_API_URL||"https://api.openai.com/v1/chat/completions",r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json","Authorization":"Bearer "+process.env.AI_API_KEY},body:JSON.stringify({model:process.env.AI_MODEL||"gpt-4o-mini",messages:[{role:"system",content:"Accurate, cautious public-biography researcher."},{role:"user",content:prompt}],temperature:.2})}),d=await r.json();if(!r.ok)throw Error(d?.error?.message||"AI provider error");return d?.choices?.[0]?.message?.content||"No AI response returned."}
+export default async (req) => {
+  // Handle browser preflight request
+  if (req.method === "OPTIONS") {
+    return new Response("", {
+      status: 204,
+      headers: corsHeaders(),
+    });
+  }
+
+  if (req.method !== "POST") {
+    return json(
+      { error: "Method not allowed. Please use POST." },
+      405
+    );
+  }
+
+  try {
+    const body = await req.json();
+
+    const name = String(body.name || "").trim();
+    const researchType = String(
+      body.researchType || "General biography"
+    ).trim();
+    const question = String(body.question || "").trim();
+
+    if (!name) {
+      return json(
+        { error: "Please enter the person's name." },
+        400
+      );
+    }
+
+    // Read the secret keys from Netlify Environment Variables
+    const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+    const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
+
+    if (!GEMINI_API_KEY) {
+      return json(
+        { error: "GEMINI_API_KEY is missing from Netlify." },
+        500
+      );
+    }
+
+    if (!TAVILY_API_KEY) {
+      return json(
+        { error: "TAVILY_API_KEY is missing from Netlify." },
+        500
+      );
+    }
+
+    // =========================================================
+    // STEP 1: SEARCH THE PUBLIC WEB WITH TAVILY
+    // =========================================================
+
+    const searchQuery = `
+      ${name}
+      ${researchType}
+      ${question}
+    `.trim();
+
+    const tavilyResponse = await fetch(
+      "https://api.tavily.com/search",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          api_key: TAVILY_API_KEY,
+          query: searchQuery,
+          search_depth: "advanced",
+          topic: "general",
+          max_results: 8,
+          include_answer: true,
+          include_raw_content: false,
+        }),
+      }
+    );
+
+    if (!tavilyResponse.ok) {
+      const errorText = await tavilyResponse.text();
+
+      console.error("Tavily error:", errorText);
+
+      return json(
+        {
+          error: "Tavily web search failed.",
+          details: errorText,
+        },
+        502
+      );
+    }
+
+    const tavilyData = await tavilyResponse.json();
+
+    const results = Array.isArray(tavilyData.results)
+      ? tavilyData.results
+      : [];
+
+    // Prepare the search results for Gemini
+    const sources = results.map((item, index) => ({
+      number: index + 1,
+      title: item.title || "Untitled source",
+      url: item.url || "",
+      content: item.content || "",
+    }));
+
+    const evidence = sources
+      .map(
+        (source) => `
+SOURCE ${source.number}
+
+Title:
+${source.title}
+
+URL:
+${source.url}
+
+Information:
+${source.content}
+`
+      )
+      .join("\n-------------------------\n");
+
+    // =========================================================
+    // STEP 2: ASK GEMINI TO ANALYZE THE SOURCES
+    // =========================================================
+
+    const prompt = `
+You are EvaDiamond BioIntel, a professional public-biography
+research and intelligence assistant.
+
+SUBJECT:
+${name}
+
+RESEARCH AREA:
+${researchType}
+
+USER QUESTION:
+${question || "Provide a comprehensive biography."}
+
+Your task is to analyze the supplied public sources and produce
+an accurate, evidence-aware research report.
+
+IMPORTANT RULES:
+
+1. Use only information supported by the supplied sources.
+2. Never invent facts.
+3. Do not present guesses as facts.
+4. If sources disagree, clearly mention the disagreement.
+5. If information cannot be adequately verified, say so.
+6. Do not expose private or sensitive personal information.
+7. Do not provide private addresses, phone numbers, passwords,
+   financial information, private medical information or other
+   sensitive personal data.
+
+MARITAL STATUS:
+
+Be particularly careful with marriage and family information.
+
+Do NOT say that a person is unmarried simply because you could
+not find information about a spouse.
+
+Distinguish between:
+
+- Currently married
+- Previously married
+- Spouse publicly documented
+- Marriage publicly reported but not sufficiently verified
+- Marital status not publicly confirmed
+
+Create the report using these sections:
+
+PROFILE
+EARLY LIFE AND BACKGROUND
+EDUCATION
+CAREER
+MAJOR ACHIEVEMENTS
+TIMELINE
+MARRIAGE / FAMILY INFORMATION
+KEY FINDINGS
+SOURCE NOTES
+
+Return ONLY valid JSON using exactly this structure:
+
+{
+  "profile": "",
+  "earlyLife": "",
+  "education": "",
+  "career": "",
+  "achievements": [],
+  "timeline": [
+    {
+      "year": "",
+      "event": ""
+    }
+  ],
+  "maritalStatus": "",
+  "familyInformation": "",
+  "keyFindings": [],
+  "sourceNotes": ""
+}
+
+PUBLIC SOURCES:
+
+${evidence}
+`;
+
+    const geminiResponse = await fetch(
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" +
+        encodeURIComponent(GEMINI_API_KEY),
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          contents: [
+            {
+              parts: [
+                {
+                  text: prompt,
+                },
+              ],
+            },
+          ],
+          generationConfig: {
+            temperature: 0.2,
+            responseMimeType: "application/json",
+          },
+        }),
+      }
+    );
+
+    if (!geminiResponse.ok) {
+      const errorText = await geminiResponse.text();
+
+      console.error("Gemini error:", errorText);
+
+      return json(
+        {
+          error: "Gemini AI request failed.",
+          details: errorText,
+        },
+        502
+      );
+    }
+
+    const geminiData = await geminiResponse.json();
+
+    const generatedText =
+      geminiData?.candidates?.[0]?.content?.parts?.[0]?.text;
+
+    if (!generatedText) {
+      return json(
+        {
+          error: "Gemini returned an empty response.",
+        },
+        502
+      );
+    }
+
+    // =========================================================
+    // STEP 3: CONVERT GEMINI RESPONSE INTO JSON
+    // =========================================================
+
+    let report;
+
+    try {
+      report = JSON.parse(generatedText);
+    } catch (parseError) {
+      console.error("JSON parsing error:", parseError);
+
+      report = {
+        profile: generatedText,
+        earlyLife: "",
+        education: "",
+        career: "",
+        achievements: [],
+        timeline: [],
+        maritalStatus:
+          "Marital status could not be separately verified from the available sources.",
+        familyInformation: "",
+        keyFindings: [],
+        sourceNotes: "",
+      };
+    }
+
+    // =========================================================
+    // STEP 4: SEND REPORT BACK TO EVA DIAMOND
+    // =========================================================
+
+    return json({
+      success: true,
+      subject: name,
+      researchType,
+      report,
+
+      sources: sources.map((source) => ({
+        number: source.number,
+        title: source.title,
+        url: source.url,
+      })),
+
+      searchedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error("EvaDiamond BioIntel error:", error);
+
+    return json(
+      {
+        error: "EvaDiamond BioIntel could not complete the research.",
+        details: error?.message || "Unknown error",
+      },
+      500
+    );
+  }
+};
+
+
+// =============================================================
+// HELPER: JSON RESPONSE
+// =============================================================
+
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      ...corsHeaders(),
+      "Content-Type": "application/json",
+    },
+  });
+}
+
+
+// =============================================================
+// HELPER: CORS
+// =============================================================
+
+function corsHeaders() {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+  };
+}
